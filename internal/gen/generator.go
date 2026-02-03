@@ -473,14 +473,6 @@ func (f Field) Type() string {
 // Value returns the field value string with column name for template generation
 func (f Field) Value() string {
 	fieldType := f.Type()
-	// Check if this is a relation field based on the type
-	if strings.HasPrefix(fieldType, "field.Struct[") {
-		return fmt.Sprintf("%s{}.WithName(%q)", fieldType, f.Name)
-	} else if strings.HasPrefix(fieldType, "field.Slice[") {
-		return fmt.Sprintf("%s{}.WithName(%q)", fieldType, f.Name)
-	}
-
-	// Regular field
 	return fmt.Sprintf("%s{}.WithColumn(%q)", fieldType, f.DBName)
 }
 
