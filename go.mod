@@ -1,4 +1,4 @@
-module gorm.io/cli/gorm
+module idane/gormgen-cli
 
 go 1.21
 
