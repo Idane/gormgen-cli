@@ -1,7 +1,7 @@
 # GORM CLI
 
 GORM CLI generates two complementary layers of code for your GORM projects:
- 
+  
 * **Type-safe, interface-driven query APIs** — from Go interfaces with powerful SQL templates
 * **Model-based field helpers** — from your model structs for filters, updates, ordering, and associations
 
