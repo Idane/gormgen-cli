@@ -11,7 +11,7 @@ import (
 
 func main() {
 	rootCmd := &cobra.Command{
-		Use:   "gorm",
+		Use:   "gorm2",
 		Short: "GORM CLI Tool",
 	}
 
