@@ -1,4 +1,4 @@
-module idane/gormgen-cli
+module github.com/idane/gormgen-cli
 
 go 1.25.5
 
