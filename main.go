@@ -5,8 +5,8 @@ import (
 	"os"
 	"runtime/debug"
 
+	"github.com/Idane/gormgen-cli/internal/gen"
 	"github.com/spf13/cobra"
-	"gorm.io/cli/gorm/internal/gen"
 )
 
 func main() {
