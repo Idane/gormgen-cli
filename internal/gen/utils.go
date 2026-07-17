@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 
 	"golang.org/x/tools/go/packages"
 	_ "gorm.io/gorm"
@@ -73,79 +74,151 @@ func ImplementsAllowedInterfaces(typ types.Type) bool {
 	return false
 }
 
+var (
+	goModDirMu    sync.Mutex
+	goModDirCache = map[string]string{}
+)
+
 func findGoModDir(filename string) string {
+	dir := filepath.Dir(filename)
+
+	goModDirMu.Lock()
+	defer goModDirMu.Unlock()
+	if cached, ok := goModDirCache[dir]; ok {
+		return cached
+	}
+
 	cmd := exec.Command("go", "env", "GOMOD")
-	cmd.Dir = filepath.Dir(filename)
+	cmd.Dir = dir
 	out, _ := cmd.Output()
-	return filepath.Dir(string(out))
+	result := filepath.Dir(string(out))
+
+	goModDirCache[dir] = result
+	return result
 }
+
+var (
+	pkgPathMu    sync.Mutex
+	pkgPathCache = map[string]string{}
+)
 
 // getCurrentPackagePath gets the full import path of the current file's package
 func getCurrentPackagePath(filename string) string {
+	dir := filepath.Dir(filename)
+
+	pkgPathMu.Lock()
+	defer pkgPathMu.Unlock()
+	if cached, ok := pkgPathCache[dir]; ok {
+		return cached
+	}
+
 	cfg := &packages.Config{
 		Mode: packages.NeedName,
 		Dir:  findGoModDir(filename),
 	}
 
-	pkgs, err := packages.Load(cfg, filepath.Dir(filename))
-	if err == nil && len(pkgs) > 0 && pkgs[0].PkgPath != "" {
-		return pkgs[0].PkgPath
+	var result string
+	if pkgs, err := packages.Load(cfg, dir); err == nil && len(pkgs) > 0 && pkgs[0].PkgPath != "" {
+		result = pkgs[0].PkgPath
 	}
-	return ""
+
+	pkgPathCache[dir] = result
+	return result
 }
 
-// loadNamedType returns a named type from a package with basic caching.
-func loadNamedType(modRoot, pkgPath, name string) types.Type {
-	cfg := &packages.Config{
-		Mode: packages.NeedTypes | packages.NeedName | packages.NeedDeps,
-		Dir:  modRoot,
-	}
+// packages.Load is expensive (it type-checks the target package and its whole
+// dependency graph), and the generator resolves hundreds of fields against a
+// handful of distinct packages. Cache each loaded package by (modRoot, pkgPath)
+// so every package is loaded at most once per run.
+var (
+	loadedTypesMu    sync.Mutex
+	loadedTypesCache = map[string]*types.Package{}
 
-	pkgs, err := packages.Load(cfg, pkgPath)
-	if err != nil || len(pkgs) == 0 || pkgs[0].Types == nil {
+	loadedStructMu    sync.Mutex
+	loadedStructCache = map[string]map[string]*ast.StructType{}
+)
+
+func pkgCacheKey(modRoot, pkgPath string) string {
+	return modRoot + "\x00" + pkgPath
+}
+
+// loadNamedType returns a named type from a package, caching the loaded package.
+func loadNamedType(modRoot, pkgPath, name string) types.Type {
+	key := pkgCacheKey(modRoot, pkgPath)
+
+	loadedTypesMu.Lock()
+	pkg, ok := loadedTypesCache[key]
+	if !ok {
+		cfg := &packages.Config{
+			Mode: packages.NeedTypes | packages.NeedName | packages.NeedDeps,
+			Dir:  modRoot,
+		}
+		if pkgs, err := packages.Load(cfg, pkgPath); err == nil && len(pkgs) > 0 {
+			pkg = pkgs[0].Types
+		}
+		loadedTypesCache[key] = pkg // cache misses (nil) too, to avoid re-loading
+	}
+	loadedTypesMu.Unlock()
+
+	if pkg == nil {
 		return nil
 	}
-	if obj := pkgs[0].Types.Scope().Lookup(name); obj != nil {
+	if obj := pkg.Scope().Lookup(name); obj != nil {
 		return obj.Type()
 	}
 	return nil
 }
 
-// loadStructFromPackage loads a struct type definition from an external package by name
+// loadNamedStructType loads a struct type definition from an external package by
+// name, caching the package's struct declarations by (modRoot, pkgPath).
 func loadNamedStructType(modRoot, pkgPath, name string) (*ast.StructType, error) {
-	cfg := &packages.Config{
-		Mode: packages.NeedSyntax | packages.NeedFiles | packages.NeedCompiledGoFiles | packages.NeedName,
-		Dir:  modRoot,
-	}
+	key := pkgCacheKey(modRoot, pkgPath)
 
-	pkgs, err := packages.Load(cfg, pkgPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load package %q from %v: %w", pkgPath, modRoot, err)
-	}
+	loadedStructMu.Lock()
+	structs, ok := loadedStructCache[key]
+	if !ok {
+		cfg := &packages.Config{
+			Mode: packages.NeedSyntax | packages.NeedFiles | packages.NeedCompiledGoFiles | packages.NeedName,
+			Dir:  modRoot,
+		}
 
-	if len(pkgs) == 0 {
-		return nil, fmt.Errorf("no packages found for path %q from %v", pkgPath, modRoot)
-	}
+		pkgs, err := packages.Load(cfg, pkgPath)
+		if err != nil {
+			loadedStructMu.Unlock()
+			return nil, fmt.Errorf("failed to load package %q from %v: %w", pkgPath, modRoot, err)
+		}
+		if len(pkgs) == 0 {
+			loadedStructMu.Unlock()
+			return nil, fmt.Errorf("no packages found for path %q from %v", pkgPath, modRoot)
+		}
 
-	for _, pkg := range pkgs {
-		for _, syntax := range pkg.Syntax {
-			for _, decl := range syntax.Decls {
-				gen, ok := decl.(*ast.GenDecl)
-				if !ok {
-					continue
-				}
-				for _, spec := range gen.Specs {
-					ts, ok := spec.(*ast.TypeSpec)
-					if ok && ts.Name.Name == name {
+		structs = map[string]*ast.StructType{}
+		for _, pkg := range pkgs {
+			for _, syntax := range pkg.Syntax {
+				for _, decl := range syntax.Decls {
+					gen, ok := decl.(*ast.GenDecl)
+					if !ok {
+						continue
+					}
+					for _, spec := range gen.Specs {
+						ts, ok := spec.(*ast.TypeSpec)
+						if !ok {
+							continue
+						}
 						if st, ok := ts.Type.(*ast.StructType); ok {
-							return st, nil
+							structs[ts.Name.Name] = st
 						}
 					}
 				}
 			}
 		}
+		loadedStructCache[key] = structs
 	}
+	loadedStructMu.Unlock()
 
+	if st, ok := structs[name]; ok {
+		return st, nil
+	}
 	return nil, fmt.Errorf("struct %s not found in package %s", name, pkgPath)
 }
 
